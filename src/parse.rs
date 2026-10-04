@@ -416,6 +416,7 @@ impl<'a> Parser<'a> {
                     AstNode::Backref {
                         target,
                         casei: self.flag(FLAG_CASEI),
+                        unicode: self.flag(FLAG_UNICODE),
                         relative_recursion_level,
                     },
                     ix,
@@ -516,6 +517,7 @@ impl<'a> Parser<'a> {
                 AstNode::Backref {
                     target: CaptureGroupTarget::ByNumber(group),
                     casei: self.flag(FLAG_CASEI),
+                    unicode: self.flag(FLAG_UNICODE),
                     relative_recursion_level: None,
                 },
                 ix,
@@ -1080,6 +1082,10 @@ impl<'a> Parser<'a> {
         let mut ix = start;
         let mut neg = false;
         let oldflags = self.flags;
+        // Where a `u` asked to change Unicode mode. Allowed only for a scoped group holding
+        // nothing but backreferences, where it picks how they fold case; anywhere else the
+        // change is refused as before, at this position.
+        let mut unicode_change = None;
         loop {
             ix = self.optional_whitespace(ix)?;
             if ix == self.re.len() {
@@ -1095,10 +1101,8 @@ impl<'a> Parser<'a> {
                 b'x' => self.update_flag(FLAG_IGNORE_SPACE, neg),
                 b'u' => {
                     if neg == self.flag(FLAG_UNICODE) {
-                        return Err(Error::ParseError(
-                            ix,
-                            ParseError::ChangingUnicodeModeUnsupported,
-                        ));
+                        unicode_change.get_or_insert(ix);
+                        self.update_flag(FLAG_UNICODE, neg);
                     }
                 }
                 b'-' => {
@@ -1110,6 +1114,12 @@ impl<'a> Parser<'a> {
                 b')' => {
                     if ix == start || neg && ix == start + 1 {
                         return Err(unknown_flag(self.re, start, ix));
+                    }
+                    if let Some(at) = unicode_change {
+                        return Err(Error::ParseError(
+                            at,
+                            ParseError::ChangingUnicodeModeUnsupported,
+                        ));
                     }
                     return Ok((ix + 1, Expr::Empty));
                 }
@@ -1128,6 +1138,14 @@ impl<'a> Parser<'a> {
                         ));
                     };
                     self.flags = oldflags;
+                    if let Some(at) = unicode_change {
+                        if !only_backrefs(&child) {
+                            return Err(Error::ParseError(
+                                at,
+                                ParseError::ChangingUnicodeModeUnsupported,
+                            ));
+                        }
+                    }
                     return Ok((ix + 1, child));
                 }
                 _ => return Err(unknown_flag(self.re, start, ix)),
@@ -1526,6 +1544,7 @@ impl Resolver {
                 AstNode::Backref {
                     target,
                     casei,
+                    unicode,
                     relative_recursion_level,
                 } => {
                     // TODO: if multiple groups with the same name, ideally we would
@@ -1553,6 +1572,7 @@ impl Resolver {
                             Expr::Backref {
                                 group: resolved_group,
                                 casei: *casei,
+                                unicode: *unicode,
                             }
                         };
                     } else {
@@ -1829,6 +1849,23 @@ fn remap_unicode_property_if_necessary(
         }
     } else {
         String::from(property_name)
+    }
+}
+
+/// Whether `expr` is one or more backreferences and nothing else -- the only body a scoped
+/// `(?-u:...)` may hold, since a backreference is the one construct whose Unicode mode this
+/// crate decides itself rather than delegating.
+fn only_backrefs(expr: &Expr) -> bool {
+    match expr {
+        Expr::AstNode(
+            AstNode::Backref {
+                relative_recursion_level: None,
+                ..
+            },
+            _,
+        ) => true,
+        Expr::Concat(children) => !children.is_empty() && children.iter().all(only_backrefs),
+        _ => false,
     }
 }
 
@@ -2218,7 +2255,8 @@ mod tests {
                 make_group(make_literal("y")),
                 Expr::Backref {
                     group: 2,
-                    casei: false
+                    casei: false,
+                    unicode: true
                 },
             ])
         );
@@ -2561,6 +2599,7 @@ mod tests {
                 Expr::Backref {
                     group: 1,
                     casei: false,
+                    unicode: true,
                 },
             ])
         );
@@ -2580,6 +2619,7 @@ mod tests {
                 Expr::Backref {
                     group: 1,
                     casei: false,
+                    unicode: true,
                 },
             ])
         );
@@ -2600,6 +2640,7 @@ mod tests {
                 Expr::Backref {
                     group: 2,
                     casei: false,
+                    unicode: true,
                 },
             ])
         );
@@ -2614,6 +2655,7 @@ mod tests {
                 Expr::Backref {
                     group: 2,
                     casei: false,
+                    unicode: true,
                 },
                 make_group(Expr::Any {
                     newline: false,
@@ -3511,6 +3553,7 @@ mod tests {
                 make_group(Expr::Backref {
                     group: 1,
                     casei: false,
+                    unicode: true,
                 },)
             ])
         );
@@ -3717,6 +3760,7 @@ mod tests {
                         Expr::Backref {
                             group: 2,
                             casei: false,
+                            unicode: true,
                         },
                     ],),
                 ],),),

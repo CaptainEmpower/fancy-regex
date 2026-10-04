@@ -750,6 +750,12 @@ impl RegexOptionsBuilder {
     /// [`ParseError::ChangingUnicodeModeUnsupported`] error. Use this builder
     /// method to set the desired mode instead.
     ///
+    /// The one exception is a scoped group holding nothing but backreferences,
+    /// such as `(?i-u:\1)`. There the flag picks how those references fold
+    /// case: by ASCII alone, so an ASCII letter matches either case of itself
+    /// and every other character only itself -- Python's `re.ASCII |
+    /// re.IGNORECASE`. No other part of the pattern changes mode.
+    ///
     /// ## Effect on `str` input (default)
     ///
     /// When matching against `&str` (the default), the underlying engine
@@ -2387,6 +2393,10 @@ pub enum Expr {
         group: usize,
         /// Whether the matching is case-insensitive or not
         casei: bool,
+        /// Whether case-insensitive matching folds by Unicode (`true`) or by ASCII alone
+        /// (`false`, from a scoped `(?-u:...)` holding only backreferences): an ASCII letter
+        /// matches either case of itself and every other character only itself.
+        unicode: bool,
     },
     /// Back reference to a capture group at the given specified relative recursion level.
     BackrefWithRelativeRecursionLevel {
@@ -2470,6 +2480,9 @@ pub enum AstNode {
         /// Whether the matching is case-insensitive or not
         // TODO: move out of Backref and prefer a Flags AstNode. The resolver can then track the flags and set casei on the resolved Expr accordingly
         casei: bool,
+        /// Whether case-insensitive matching folds by Unicode or by ASCII alone; see
+        /// [`Expr::Backref`]
+        unicode: bool,
         /// Optional relative recursion level for the backreference
         relative_recursion_level: Option<isize>,
     },
@@ -3328,7 +3341,8 @@ mod tests {
         .is_leaf_node());
         assert!(Expr::Backref {
             group: 1,
-            casei: false
+            casei: false,
+            unicode: true
         }
         .is_leaf_node());
         assert!(Expr::BackrefWithRelativeRecursionLevel {
