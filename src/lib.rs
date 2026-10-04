@@ -21,6 +21,7 @@
 #![doc = include_str!("../docs/main.md")]
 #![doc = include_str!("../docs/features.md")]
 #![doc = include_str!("../docs/syntax.md")]
+#![doc = include_str!("../docs/oniguruma_compatibility.md")]
 #![doc = include_str!("../docs/subroutines/1_intro.md")]
 #![doc = include_str!("../docs/subroutines/2_flags.md")]
 #![doc = include_str!("../docs/subroutines/3_left_recursion.md")]
@@ -51,6 +52,7 @@ use regex_automata::Anchored as RaAnchored;
 use regex_automata::Input as RaInput;
 
 mod analyze;
+mod byte_set;
 mod bytes;
 mod compile;
 mod error;
@@ -75,6 +77,9 @@ use crate::parse_flags::*;
 use crate::vm::OPTION_LEFTMOST_LONGEST;
 use crate::vm::{Prog, OPTION_FIND_NOT_EMPTY, OPTION_NOT_CONTINUED_FROM_PREVIOUS_MATCH};
 
+use bit_set::BitSet;
+
+pub use crate::byte_set::ByteSet;
 pub use crate::bytes::MatchBytes;
 pub use crate::error::{CompileError, Error, ParseError, Result, RuntimeError};
 pub use crate::expand::Expander;
@@ -175,6 +180,11 @@ enum RegexImpl {
         explicit_capture_group_0: bool,
         /// The actual pattern passed to regex-automata for delegation
         delegated_pattern: String,
+        /// Group indices that are inside {0} (zero-repetition) quantifiers.
+        /// These groups never participate in matching, so their captures
+        /// return None even though they exist in the regex-automata engine
+        /// for correct group-counting.
+        zero_rep_groups: BitSet,
     },
     Fancy {
         prog: Arc<Prog>,
@@ -349,6 +359,9 @@ enum CapturesImpl {
         /// Therefore what is actually capture group 1 should be treated as capture group 0, and all other
         /// capture groups should have their index reduced by one as well to line up with what the pattern specifies.
         explicit_capture_group_0: bool,
+        /// Group indices that are inside {0} (zero-repetition) quantifiers.
+        /// These groups never participate in matching, so their captures return None.
+        zero_rep_groups: BitSet,
     },
     Fancy {
         saves: Vec<usize>,
@@ -361,9 +374,15 @@ impl CapturesImpl {
             CapturesImpl::Wrap {
                 locations,
                 explicit_capture_group_0,
-            } => locations
-                .get_group(i + if *explicit_capture_group_0 { 1 } else { 0 })
-                .map(|span| (span.start, span.end)),
+                zero_rep_groups,
+            } => {
+                if zero_rep_groups.contains(i) {
+                    return None;
+                }
+                locations
+                    .get_group(i + if *explicit_capture_group_0 { 1 } else { 0 })
+                    .map(|span| (span.start, span.end))
+            }
             CapturesImpl::Fancy { saves } => {
                 let slot = i * 2;
                 if slot >= saves.len() {
@@ -384,6 +403,7 @@ impl CapturesImpl {
             CapturesImpl::Wrap {
                 locations,
                 explicit_capture_group_0,
+                ..
             } => locations.group_len() - if *explicit_capture_group_0 { 1 } else { 0 },
             CapturesImpl::Fancy { saves } => saves.len() / 2,
         }
@@ -512,6 +532,12 @@ struct RegexOptions {
     syntaxc: SyntaxConfig,
     delegate_size_limit: Option<usize>,
     delegate_dfa_size_limit: Option<usize>,
+    /// Optional cap on the number of VM instructions emitted while compiling.
+    /// Subroutine calls are inlined at compile time, so a self- or
+    /// mutually-recursive pattern can expand without bound even while the
+    /// recursion-depth cap is respected; this bounds the emitted instruction
+    /// vector instead. `None` disables the check.
+    max_prog_size: Option<usize>,
     oniguruma_mode: bool,
     ignore_numbered_groups_when_named_groups_exist: bool,
     hard_regex_runtime_options: HardRegexRuntimeOptions,
@@ -540,6 +566,7 @@ impl fmt::Debug for RegexOptions {
             .field("syntaxc", &self.syntaxc)
             .field("delegate_size_limit", &self.delegate_size_limit)
             .field("delegate_dfa_size_limit", &self.delegate_dfa_size_limit)
+            .field("max_prog_size", &self.max_prog_size)
             .field("oniguruma_mode", &self.oniguruma_mode)
             .field(
                 "ignore_numbered_groups_when_named_groups_exist",
@@ -563,6 +590,7 @@ impl Default for RegexOptions {
             syntaxc: SyntaxConfig::new().unicode(true),
             delegate_size_limit: None,
             delegate_dfa_size_limit: None,
+            max_prog_size: None,
             oniguruma_mode: false,
             ignore_numbered_groups_when_named_groups_exist: false,
             hard_regex_runtime_options: HardRegexRuntimeOptions::default(),
@@ -790,6 +818,18 @@ impl RegexOptionsBuilder {
         self
     }
 
+    /// Set the maximum number of VM instructions the compiled program may
+    /// contain. Subroutine calls are inlined at compile time, so a self- or
+    /// mutually-recursive pattern can expand without bound even while the
+    /// recursion-depth cap is respected; this bounds the emitted instruction
+    /// vector instead. If exceeded, compilation returns
+    /// `CompileError::PatternTooComplex`. `None` (the default) disables the
+    /// check, preserving the previous behavior.
+    pub fn max_prog_size(&mut self, limit: usize) -> &mut Self {
+        self.options.max_prog_size = Some(limit);
+        self
+    }
+
     /// Require that matches are non-empty (i.e. match at least one character).
     ///
     /// When this is enabled, any match attempt that would result in a zero-length match is
@@ -1003,6 +1043,51 @@ impl RegexOptionsBuilder {
             .allow_input_assertion_overrides = yes;
         self
     }
+
+    /// Whether to build a prefilter for this Regex.
+    /// If you only do anchored search, the prefilter would not be used and would just waste
+    /// time and memory to build it.
+    pub fn build_delegate_prefilter(&mut self, yes: bool) -> &mut Self {
+        self.options.delegate_prefilter = yes;
+        self
+    }
+
+    /// Computes the bytes a match of `pattern` can start with, without compiling it.
+    /// The possible return values are:
+    ///
+    /// - `Ok(Some(set))`: a byte set could be built and you can quickly check whether a byte
+    ///   could match the pattern without calling the regex
+    /// - `Ok(None)`: we couldn't built a byte set from the pattern so any byte could match
+    /// - `Err(..)`: the pattern is invalid
+    ///
+    /// This is useful if you are building your own prefilter.
+    ///
+    /// ```
+    /// # use fancy_regex::RegexOptionsBuilder;
+    /// let builder = RegexOptionsBuilder::new();
+    /// let set = builder.start_bytes(r"fn|let|impl").unwrap().unwrap();
+    /// assert_eq!(set.iter().collect::<Vec<_>>(), vec![b'f', b'i', b'l']);
+    /// assert!(builder.start_bytes(r"a?").unwrap().is_none());
+    /// ```
+    pub fn start_bytes(&self, pattern: &str) -> Result<Option<ByteSet>> {
+        crate::byte_set::start_bytes(pattern, &self.options)
+    }
+
+    /// Returns the [ByteSet] for the required bytes of the given pattern.
+    /// For example, a pattern `a?b` will unconditionally require `b` to be found in the
+    /// haystack. This means that for a haystack like `aaa` the pattern will _never_ match and
+    /// we can know that without even compiling the regex.
+    /// An empty set means there's nothing actionable.
+    ///
+    /// ```
+    /// # use fancy_regex::RegexOptionsBuilder;
+    /// let builder = RegexOptionsBuilder::new();
+    /// let set = builder.required_bytes(r"a?b").unwrap();
+    /// assert_eq!(set.iter().collect::<Vec<_>>(), vec![b'b']);
+    /// ```
+    pub fn required_bytes(&self, pattern: &str) -> Result<ByteSet> {
+        crate::byte_set::required_bytes(pattern, &self.options)
+    }
 }
 
 impl RegexBuilder {
@@ -1079,6 +1164,12 @@ impl RegexBuilder {
     /// See [`RegexOptionsBuilder::delegate_dfa_size_limit`]
     pub fn delegate_dfa_size_limit(&mut self, limit: usize) -> &mut Self {
         self.options.delegate_dfa_size_limit(limit);
+        self
+    }
+
+    /// See [`RegexOptionsBuilder::max_prog_size`]
+    pub fn max_prog_size(&mut self, limit: usize) -> &mut Self {
+        self.options.max_prog_size(limit);
         self
     }
 
@@ -1251,6 +1342,7 @@ impl Regex {
             // string path for anything the translator doesn't cover.
             let utf8 = matches!(compile_options.bytes_mode, BytesMode::Unicode);
             let mut hir_ctx = to_hir::HirCtx::new(compile_options.unicode, utf8);
+            hir_ctx.enable_preserve_zero_rep_captures();
             let inner = match to_hir::expr_to_hir(&tree.expr, &mut hir_ctx) {
                 Some(hir) => compile::compile_inner_from_hir(&hir, &compile_options, usage)?,
                 None => compile::compile_inner(&re_cooked, &compile_options, usage)?,
@@ -1261,6 +1353,7 @@ impl Regex {
                     pattern,
                     explicit_capture_group_0: requires_capture_group_fixup,
                     delegated_pattern: re_cooked,
+                    zero_rep_groups: hir_ctx.into_zero_rep_groups(),
                 },
                 named_groups: Arc::new(tree.named_groups),
             });
@@ -1278,6 +1371,7 @@ impl Regex {
                     && !matches!(options.bytes_mode, BytesMode::Ascii),
                 delegate_size_limit: options.delegate_size_limit,
                 delegate_dfa_size_limit: options.delegate_dfa_size_limit,
+                max_prog_size: options.max_prog_size,
             },
         )?;
         Ok(Regex {
@@ -1659,11 +1753,13 @@ impl Regex {
             RegexImpl::Wrap {
                 inner,
                 explicit_capture_group_0,
+                zero_rep_groups,
                 ..
             } => {
                 // find_not_empty patterns are always compiled as Fancy, so find_not_empty is
                 // always false here.
                 let explicit = *explicit_capture_group_0;
+                let zero_rep_groups = zero_rep_groups.clone();
                 let mut locations = inner.create_captures();
                 let mut delegated_input = ra_input(input);
                 if input.is_anchored() {
@@ -1674,6 +1770,7 @@ impl Regex {
                     inner: CapturesImpl::Wrap {
                         locations,
                         explicit_capture_group_0: explicit,
+                        zero_rep_groups,
                     },
                     named_groups,
                     input: haystack,
@@ -1738,8 +1835,12 @@ impl Regex {
     pub fn capture_names(&self) -> CaptureNames<'_> {
         let mut names = Vec::new();
         names.resize(self.captures_len(), None);
-        for (name, &i) in self.named_groups.iter() {
-            names[i] = Some(name.as_str());
+        for (name, groups) in self.named_groups.iter() {
+            for &i in groups {
+                if let Some(slot) = names.get_mut(i) {
+                    *slot = Some(name.as_str());
+                }
+            }
         }
         CaptureNames(names.into_iter())
     }
@@ -2103,7 +2204,10 @@ impl<'t, S: input::Input + ?Sized> Captures<'t, S> {
     /// Returns the match for a named capture group.  Returns `None` the capture
     /// group did not match or if there is no group with the given name.
     pub fn name(&self, name: &str) -> Option<S::Match<'t>> {
-        self.named_groups.get(name).and_then(|i| self.get(*i))
+        self.named_groups
+            .get(name)
+            .and_then(|groups| groups.last())
+            .and_then(|i| self.get(*i))
     }
 
     /// Iterate over the captured groups in order in which they appeared in the regex. The first
@@ -2238,6 +2342,13 @@ pub enum Expr {
         val: String,
         /// Whether match is case-insensitive or not
         casei: bool,
+    },
+    /// A literal consisting of raw bytes, produced by `\xHH` escapes where
+    /// the byte value is greater than 0x7F. In Unicode mode these are
+    /// re-encoded as UTF-8; in bytes modes they match the exact byte sequence.
+    LiteralBytes {
+        /// The raw bytes to match
+        bytes: Vec<u8>,
     },
     /// Concatenation of multiple expressions, must match in order, e.g. `a.` is a concatenation of
     /// the literal `a` and `.` for any character
@@ -2767,6 +2878,7 @@ impl Expr {
                 | Expr::Assertion(_)
                 | Expr::GeneralNewline { .. }
                 | Expr::Literal { .. }
+                | Expr::LiteralBytes { .. }
                 | Expr::Delegate { .. }
                 | Expr::Backref { .. }
                 | Expr::BackrefWithRelativeRecursionLevel { .. }
@@ -3221,6 +3333,7 @@ mod tests {
             casei: false
         }
         .is_leaf_node());
+        assert!(Expr::LiteralBytes { bytes: vec![0x80] }.is_leaf_node());
         assert!(Expr::Delegate {
             inner: "[0-9]".to_string(),
             casei: false,

@@ -278,11 +278,13 @@ fn escape_delegate(s: &str) -> String {
 /// Build a reverse lookup map from group index to name from the named_groups map.
 /// This converts from (name → index) to (index → name) format.
 fn build_group_names_lookup(
-    named_groups: &std::collections::HashMap<String, usize>,
+    named_groups: &std::collections::HashMap<String, Vec<usize>>,
 ) -> std::collections::HashMap<usize, String> {
     let mut group_names = std::collections::HashMap::new();
-    for (name, &index) in named_groups {
-        group_names.insert(index, name.clone());
+    for (name, indexes) in named_groups {
+        for &index in indexes {
+            group_names.insert(index, name.clone());
+        }
     }
     group_names
 }
@@ -354,6 +356,14 @@ fn info_to_tree_node<'a>(
                 }
             }
             ("Literal".to_string(), Some(summary), None)
+        }
+        Expr::LiteralBytes { bytes, .. } => {
+            let summary = bytes
+                .iter()
+                .map(|b| format!("\\x{b:02X}"))
+                .collect::<Vec<_>>()
+                .join("");
+            ("LiteralBytes".to_string(), Some(summary), None)
         }
         Expr::Concat(v) => ("Concat".to_string(), Some(format!("({})", v.len())), None),
         Expr::Alt(v) => ("Alt".to_string(), Some(format!("({})", v.len())), None),
@@ -650,6 +660,14 @@ mod tests {
         let node = parse_and_analyze_with_flags(r"\w", FLAG_CASEI);
         assert_eq!(node.kind, "Delegate");
         assert_eq!(node.casei, None);
+    }
+
+    #[test]
+    fn test_info_to_tree_node_literal_bytes() {
+        let node = parse_and_analyze(r"\xFF");
+
+        assert_eq!(node.kind, "LiteralBytes");
+        assert_eq!(node.summary.as_deref(), Some(r"\xFF"));
     }
 
     #[test]

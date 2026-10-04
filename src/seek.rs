@@ -20,6 +20,9 @@
 
 //! Seek pre-filter: build a simplified approximation of a pattern used to
 //! skip to plausible match positions before handing off to the backtracking VM.
+//!
+//! Every quantifier in the approximation is emitted lazily because we only care about
+//! the start and being lazy doesn't change the result.
 
 use alloc::format;
 use alloc::string::String;
@@ -69,27 +72,17 @@ pub(crate) fn expr_contains_positional_anchor(expr: &Expr) -> bool {
 /// and never decides matches, so a less-selective approximation stays correct.
 pub(crate) const MAX_SEEK_PATTERN_LEN: usize = 4096;
 
-/// Emit a permissive size placeholder — `(?s:.)+` or `(?s:.){N,}` — into `buf`.
+/// Emit a lazy permissive size placeholder — `(?s:.)*?`, `(?s:.)+?`, or `(?s:.){N,}?` — into `buf`.
 ///
 /// Used when a hard node cannot be represented in the seek pattern but has a known minimum
 /// size.  The placeholder is an over-approximation that avoids false negatives: it admits any
 /// run of characters of at least `min_size` length.
 pub(crate) fn emit_min_size_placeholder(buf: &mut String, min_size: usize, precedence: u8) {
-    if min_size == 0 {
-        return; // zero width: safe to drop without emitting anything
-    }
     if precedence > 2 {
         buf.push_str("(?:");
     }
     buf.push_str("(?s:.)");
-    match min_size {
-        1 => buf.push('+'),
-        n => {
-            buf.push('{');
-            crate::push_usize(buf, n);
-            buf.push_str(",}");
-        }
-    }
+    write_quantifier(buf, min_size, usize::MAX, false);
     if precedence > 2 {
         buf.push(')');
     }
@@ -269,7 +262,7 @@ pub(crate) fn build_seek_pattern_impl<'a>(
                 );
             }
         }
-        Expr::Repeat { lo, hi, greedy, .. } => {
+        Expr::Repeat { lo, hi, .. } => {
             if precedence > 2 {
                 buf.push_str("(?:");
             }
@@ -284,7 +277,7 @@ pub(crate) fn build_seek_pattern_impl<'a>(
                     inlined_groups,
                 );
             }
-            write_quantifier(buf, *lo, *hi, *greedy);
+            write_quantifier(buf, *lo, *hi, false);
             if precedence > 2 {
                 buf.push(')');
             }
@@ -353,10 +346,17 @@ pub(crate) fn build_seek_pattern_impl<'a>(
             emit_min_size_placeholder(buf, info.min_size, precedence);
         }
         Expr::SubroutineCall(target_group) => {
-            // Inline the body of the target group, honouring the recursion depth limit.
+            // Inline the body of the target group once, honouring the recursion depth limit.
             if depth < MAX_SUBROUTINE_RECURSION_DEPTH && buf.len() < MAX_SEEK_PATTERN_LEN {
                 if let Some(group_info) = group_info_map.get(target_group) {
+                    if inlined_groups.contains(target_group) {
+                        let placeholder_min = usize::from(group_info.min_size > 0);
+                        emit_min_size_placeholder(buf, placeholder_min, precedence);
+                        return;
+                    }
+
                     if !group_info.children.is_empty() {
+                        inlined_groups.push(*target_group);
                         build_seek_pattern_impl(
                             &group_info.children[0],
                             group_info_map,
@@ -366,6 +366,7 @@ pub(crate) fn build_seek_pattern_impl<'a>(
                             drop_positional_anchors,
                             inlined_groups,
                         );
+                        inlined_groups.pop();
                         return;
                     }
                     return;
@@ -467,9 +468,9 @@ pub(crate) fn build_seek_pattern_impl<'a>(
             }
         }
         // Absent repeater `(?~expr)` matches any content not containing `expr`.
-        // Approximate with `(?s:.*)` (any characters, including newline) since the repeater
+        // Approximate with `(?s:.*?)` (any characters, including newline) since the repeater
         // can consume an arbitrary number of characters.
-        Expr::Absent(Absent::Repeater(_)) => buf.push_str("(?s:.*)"),
+        Expr::Absent(Absent::Repeater(_)) => buf.push_str("(?s:.*?)"),
         // Absent expression `(?~|absent|exp)` matches `exp` subject to the absent constraint.
         // Approximate by seeking only for `exp`, dropping the constraint — this is a safe
         // over-approximation since any position where `exp` matches (ignoring the constraint)
@@ -493,6 +494,8 @@ pub(crate) fn build_seek_pattern_impl<'a>(
         | Expr::BacktrackingControlVerb(_)
         | Expr::BackrefExistsCondition { .. }
         | Expr::Absent(_) => {}
+        // Approximate since we don't want to have to deal with ascii vs unicode handling here
+        Expr::LiteralBytes { bytes } => buf.push_str(&format!("(?s:.{{0,{}}}?)", bytes.len())),
         // Easy leaf nodes (Literal, Any, Delegate) are always handled by the easy no-captures
         // early return above and never reach here. Listed explicitly so that adding a new
         // Expr variant produces a compile error until the seek-pattern case is handled.
@@ -525,12 +528,25 @@ mod tests {
     use crate::analyze::{analyze, AnalyzeContext};
     use crate::compile::populate_group_info_map;
     use crate::optimize;
+    use crate::ExprTree;
     use crate::Regex;
+    use alloc::string::ToString;
 
     /// Build the seek pattern for a regex string and return it.
     fn get_seek_pattern(re: &str) -> String {
         let mut tree = Expr::parse_tree(re).unwrap();
-        let requires_capture_group_fixup = optimize(&mut tree);
+        get_seek_pattern_for_tree(&mut tree)
+    }
+
+    /// Build the seek pattern for a regex string parsed with the given flags.
+    fn get_seek_pattern_with_flags(re: &str, flags: u32) -> String {
+        let mut tree = Expr::parse_tree_with_flags(re, flags).unwrap();
+        get_seek_pattern_for_tree(&mut tree)
+    }
+
+    // Build the seek pattern for the given ExprTree
+    fn get_seek_pattern_for_tree(tree: &mut ExprTree) -> String {
+        let requires_capture_group_fixup = optimize(tree);
 
         let info = analyze(
             &tree,
@@ -688,5 +704,61 @@ mod tests {
         );
         // Compiling it must succeed and stay well-formed.
         Regex::new(r"(end)(\s+(function))?(\s+((\3|\4|\5)))?").unwrap();
+    }
+
+    #[test]
+    fn seek_recursive_subroutine_with_empty_base_preserves_leftmost_match() {
+        let pattern = r"(?<g>(?:a\g<g>)?)b";
+        let haystack = "aab";
+
+        let mut options_no_seek = crate::RegexOptionsBuilder::new();
+        let expected = options_no_seek
+            .seek(false)
+            .build(pattern.to_string())
+            .unwrap()
+            .find(haystack)
+            .unwrap();
+
+        let mut options = crate::RegexOptionsBuilder::new();
+        options.seek(true);
+        let actual = options
+            .build(pattern.to_string())
+            .unwrap()
+            .find(haystack)
+            .unwrap();
+
+        assert_eq!(
+            expected.map(|m| (m.start(), m.end())),
+            actual.map(|m| (m.start(), m.end()))
+        );
+        assert_eq!(expected.unwrap().start, 0);
+    }
+
+    #[test]
+    fn seek_pattern_recursive_subroutine_is_inlined_once() {
+        let pattern = r"(?<tuple>\((?:[^()]|\g<tuple>)+\))\s*(?!=[=>])(?==)";
+        let seek = get_seek_pattern(pattern);
+        assert_eq!(
+            seek,
+            r#"(?:(?:\((?:[^()]|\((?:[^()]|(?s:.)+?)+?\))+?\))\s*)="#
+        );
+    }
+
+    #[test]
+    fn seek_pattern_literal_bytes() {
+        // In Unicode mode \xFF parses to a `Literal` (handled by the easy to_str path).
+        assert_eq!(get_seek_pattern(r"\xFF"), r"ÿ");
+    }
+
+    #[test]
+    fn seek_pattern_literal_bytes_ascii_mode() {
+        // In non-Unicode mode \xFF parses to `LiteralBytes`, which is hard and so
+        // reaches the seek-pattern arm that interpolates the byte length.
+        assert_eq!(get_seek_pattern_with_flags(r"\xFF", 0), r"(?s:.{0,1}?)");
+        // Two separate byte escapes are a Concat of two LiteralBytes nodes.
+        assert_eq!(
+            get_seek_pattern_with_flags(r"\xFF\xFF", 0),
+            r"(?s:.{0,1}?)(?s:.{0,1}?)"
+        );
     }
 }

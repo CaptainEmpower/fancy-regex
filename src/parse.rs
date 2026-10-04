@@ -36,9 +36,11 @@ use crate::{
 };
 
 #[cfg(not(feature = "std"))]
-pub(crate) type NamedGroups = alloc::collections::BTreeMap<String, usize>;
+use alloc::collections::BTreeMap as Map;
 #[cfg(feature = "std")]
-pub(crate) type NamedGroups = std::collections::HashMap<String, usize>;
+use std::collections::HashMap as Map;
+
+pub(crate) type NamedGroups = Map<String, Vec<usize>>;
 
 #[derive(Debug, Clone)]
 pub struct ExprTree {
@@ -85,7 +87,7 @@ impl<'a> Parser<'a> {
 
         let mut resolver = Resolver {
             named_groups: NamedGroups::default(),
-            named_group_positions: NamedGroups::default(),
+            named_group_positions: Map::default(),
             ignore_numbered_groups: p.flag(FLAG_IGNORE_NUMBERED_GROUPS_WHEN_NAMED_GROUPS_EXIST)
                 && p.has_named_groups,
             next_group_index: 1,
@@ -620,13 +622,13 @@ impl<'a> Parser<'a> {
             )
         } else if b == b'x' {
             let end = self.optional_whitespace(end)?;
-            return self.parse_hex(end, 2);
+            return self.parse_hex(end, 2, true);
         } else if b == b'u' {
             let end = self.optional_whitespace(end)?;
-            return self.parse_hex(end, 4);
+            return self.parse_hex(end, 4, false);
         } else if b == b'U' {
             let end = self.optional_whitespace(end)?;
-            return self.parse_hex(end, 8);
+            return self.parse_hex(end, 8, false);
         } else if (b | 32) == b'p' && end != bytes.len() {
             let mut end = end;
             let b = bytes[end];
@@ -735,7 +737,7 @@ impl<'a> Parser<'a> {
     }
 
     // ix points after '\x', eg to 'A0' or '{12345}', or after `\u` or `\U`
-    fn parse_hex(&self, ix: usize, digits: usize) -> Result<(usize, Expr)> {
+    fn parse_hex(&self, ix: usize, digits: usize, byte_escape: bool) -> Result<(usize, Expr)> {
         if ix >= self.re.len() {
             // Incomplete escape sequence
             return Err(Error::ParseError(ix, ParseError::InvalidHex));
@@ -745,7 +747,7 @@ impl<'a> Parser<'a> {
         // Parse fixed-width hex (e.g., \xAB)
         if ix + digits <= self.re.len() && bytes[ix..ix + digits].iter().all(|&b| is_hex_digit(b)) {
             let hex_str = &self.re[ix..ix + digits];
-            return self.hex_to_literal(ix, ix + digits, hex_str);
+            return self.hex_to_literal(ix, ix + digits, hex_str, byte_escape);
         }
         // Parse brace-enclosed hex (e.g., \u{00AB})
         if b == b'{' {
@@ -759,7 +761,10 @@ impl<'a> Parser<'a> {
                 }
                 let b = bytes[pos];
                 if b == b'}' && !hex_chars.is_empty() {
-                    return self.hex_to_literal(ix, pos + 1, &hex_chars);
+                    let is_byte = byte_escape
+                        && u32::from_str_radix(&hex_chars, 16)
+                            .map_or(false, |v| v > 0x7F && v <= 0xFF);
+                    return self.hex_to_literal(ix, pos + 1, &hex_chars, is_byte);
                 }
                 if is_hex_digit(b) && hex_chars.len() < 8 {
                     hex_chars.push(b as char);
@@ -772,9 +777,22 @@ impl<'a> Parser<'a> {
         Err(Error::ParseError(ix, ParseError::InvalidHex))
     }
 
-    fn hex_to_literal(&self, ix: usize, end: usize, hex_str: &str) -> Result<(usize, Expr)> {
-        let codepoint = u32::from_str_radix(hex_str, 16).unwrap();
-        if let Some(c) = char::from_u32(codepoint) {
+    fn hex_to_literal(
+        &self,
+        ix: usize,
+        end: usize,
+        hex_str: &str,
+        byte_escape: bool,
+    ) -> Result<(usize, Expr)> {
+        let value = u32::from_str_radix(hex_str, 16).unwrap();
+        if byte_escape && value > 0x7F && !self.flag(FLAG_UNICODE) {
+            Ok((
+                end,
+                Expr::LiteralBytes {
+                    bytes: vec![value as u8],
+                },
+            ))
+        } else if let Some(c) = char::from_u32(value) {
             Ok((
                 end,
                 Expr::Literal {
@@ -896,6 +914,11 @@ impl<'a> Parser<'a> {
                         Expr::Literal { val, .. } => {
                             debug_assert_eq!(val.chars().count(), 1);
                             escape_into(&val, &mut class);
+                        }
+                        Expr::LiteralBytes { bytes, .. } => {
+                            for b in bytes {
+                                class.push_str(&format!("\\x{b:02X}"));
+                            }
                         }
                         Expr::Delegate { inner, .. } => {
                             // Check if this is a negated property that needs && prefix
@@ -1403,7 +1426,7 @@ struct Resolver {
     /// Used to enforce that named backrefs (`\k<name>`) cannot refer to groups that appear
     /// later in the pattern (forward references by name are not supported for backrefs,
     /// only for subroutine calls).
-    named_group_positions: NamedGroups,
+    named_group_positions: Map<String, usize>,
     ignore_numbered_groups: bool,
     next_group_index: usize,
     /// Total number of capture groups in the pattern, set after the first resolution pass.
@@ -1436,7 +1459,9 @@ impl Resolver {
             if let Expr::AstNode(AstNode::AstGroup { name, inner }, ix) = node {
                 let group_index = if let Some(name) = name {
                     self.named_groups
-                        .insert(name.clone(), self.next_group_index);
+                        .entry(name.clone())
+                        .or_default()
+                        .push(self.next_group_index);
                     self.named_group_positions.insert(name, ix);
                     Some(self.next_group_index)
                 } else if !self.ignore_numbered_groups {
@@ -1493,7 +1518,10 @@ impl Resolver {
                 })
             }
             CaptureGroupTarget::ByName(name) => {
-                let group = self.named_groups.get(name.as_str()).copied();
+                let group = self
+                    .named_groups
+                    .get(name.as_str())
+                    .and_then(|groups| groups.last().copied());
                 // For backrefs, reject forward references: the group's opening `(` must appear
                 // before the backref in the pattern.
                 if let (Some(backref_ix), Some(group_ix)) = (
@@ -1563,10 +1591,18 @@ impl Resolver {
                     }
                 }
                 AstNode::SubroutineCall(target) => {
-                    // TODO: if multiple groups with this name, don't resolve
-                    // and instead just leave it as an AstNode for the analyzer to complain about
-                    if let Some(resolved_group) = self.resolve_target(target, None) {
-                        *expr = Expr::SubroutineCall(resolved_group);
+                    // If a by-name target matches multiple capture groups sharing
+                    // that name, don't resolve it: a subroutine call has no defined
+                    // meaning across several groups. Leave it as an AstNode so the
+                    // analyzer reports SubroutineCallTargetNotFound. Single-group
+                    // names (and by-number/relative targets) resolve as before, so
+                    // matching behaviour is unchanged.
+                    let ambiguous = matches!(target, CaptureGroupTarget::ByName(name)
+                        if self.named_groups.get(name.as_str()).map_or(false, |g| g.len() > 1));
+                    if !ambiguous {
+                        if let Some(resolved_group) = self.resolve_target(target, None) {
+                            *expr = Expr::SubroutineCall(resolved_group);
+                        }
                     }
                 }
                 AstNode::BackrefExistsCondition {
@@ -2059,6 +2095,7 @@ mod tests {
         assert_eq!(p("\\'"), make_literal("'"));
         assert_eq!(p("\\\""), make_literal("\""));
         assert_eq!(p("\\ "), make_literal(" "));
+        assert_eq!(p("\\x41"), make_literal("A"));
         assert_eq!(p("\\xA0"), make_literal("\u{A0}"));
         assert_eq!(p("\\x{1F4A9}"), make_literal("\u{1F4A9}"));
         assert_eq!(p("\\x{000000B7}"), make_literal("\u{B7}"));
@@ -2067,6 +2104,23 @@ mod tests {
         assert_eq!(p("\\u21D2x"), p("\u{21D2}x"));
         assert_eq!(p("\\U0001F60A"), make_literal("\u{1F60A}"));
         assert_eq!(p("\\U{0001F60A}"), make_literal("\u{1F60A}"));
+        assert_eq!(p("\\xFF"), make_literal("ÿ"));
+    }
+
+    #[test]
+    fn literal_escape_ascii_mode() {
+        fn p(s: &str) -> Expr {
+            Expr::parse_tree_with_flags(s, 0).unwrap().expr
+        }
+
+        assert_eq!(p("\\xFF"), Expr::LiteralBytes { bytes: vec![255] });
+        assert_eq!(
+            p(r"[a-z\n\xFF]"),
+            Expr::Delegate {
+                inner: "[a-z\n\\xFF]".to_string(),
+                casei: false
+            }
+        );
     }
 
     #[test]
@@ -2175,14 +2229,58 @@ mod tests {
 
         // Name that looks numeric with hyphens (treated as named, not numeric)
         let tree = Expr::parse_tree("(?<1-2>a)").unwrap();
-        assert_eq!(tree.named_groups.get("1-2"), Some(&1));
+        assert_eq!(tree.named_groups.get("1-2"), Some(&vec![1]));
 
         // Verify named_groups map is populated correctly for hyphenated names
         let tree = Expr::parse_tree("(?<foo-bar>a)").unwrap();
-        assert_eq!(tree.named_groups.get("foo-bar"), Some(&1));
+        assert_eq!(tree.named_groups.get("foo-bar"), Some(&vec![1]));
 
         let tree = Expr::parse_tree("(?P<data-value>a)").unwrap();
-        assert_eq!(tree.named_groups.get("data-value"), Some(&1));
+        assert_eq!(tree.named_groups.get("data-value"), Some(&vec![1]));
+    }
+
+    #[test]
+    fn multiple_groups_with_same_name() {
+        let tree = Expr::parse_tree("(?<a>x)(?<b>y)(?<a>z)").unwrap();
+        assert_eq!(tree.named_groups.get("a"), Some(&vec![1, 3]));
+        assert_eq!(tree.named_groups.get("b"), Some(&vec![2]));
+        assert_eq!(tree.total_groups, 3);
+
+        // A backref by name still resolves to the last group with that name.
+        let tree = Expr::parse_tree("(?<a>x)(?<a>y)\\k<a>").unwrap();
+        assert_eq!(
+            tree.expr,
+            Expr::Concat(vec![
+                make_group(make_literal("x")),
+                make_group(make_literal("y")),
+                Expr::Backref {
+                    group: 2,
+                    casei: false,
+                    unicode: true
+                },
+            ])
+        );
+        assert!(tree.backrefs.contains(2));
+        assert!(!tree.backrefs.contains(1));
+
+        // A subroutine call by name is NOT resolved when several groups share
+        // that name: it has no defined single target, so it is left as an
+        // unresolved AstNode for the analyzer to reject.
+        let tree = Expr::parse_tree("(?<a>x)(?<a>y)\\g<a>").unwrap();
+        match &tree.expr {
+            Expr::Concat(parts) => match parts.last() {
+                Some(Expr::AstNode(
+                    crate::parse::AstNode::SubroutineCall(
+                        crate::parse::CaptureGroupTarget::ByName(name),
+                    ),
+                    _,
+                )) => {
+                    assert_eq!(name, "a");
+                }
+                other => panic!("expected unresolved SubroutineCall AstNode, got {other:?}"),
+            },
+            other => panic!("expected Concat, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4461,6 +4559,17 @@ mod tests {
                 },
                 Expr::SubroutineCall(1),
             ])
+        );
+    }
+
+    #[test]
+    fn char_class() {
+        assert_eq!(
+            p(r"[a-z\n\xFF]"),
+            Expr::Delegate {
+                inner: "[a-z\nÿ]".to_string(),
+                casei: false
+            }
         );
     }
 }

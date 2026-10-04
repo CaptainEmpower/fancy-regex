@@ -34,13 +34,16 @@
 //! string path, preserving both behavior and error reporting.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
 
-use regex_syntax::hir::{Capture, Dot, Hir, Look, Repetition};
+use regex_syntax::hir::{Capture, Dot, Hir, HirKind, Look, Repetition};
 
-use crate::{push_quoted, Assertion, Expr};
+use bit_set::BitSet;
+
+use crate::{push_quoted, Assertion, BytesMode, Expr, RegexOptions};
 
 /// Context threaded through a translation: the syntax options the string path
 /// would hand to the engine's parser, plus the capture-group counter (groups
@@ -50,6 +53,21 @@ pub(crate) struct HirCtx {
     unicode: bool,
     utf8: bool,
     next_group: u32,
+    /// Memoize case-insensitive fragments
+    fragments: BTreeMap<String, Option<Hir>>,
+    /// When true, capture groups inside {0} (zero-repetition) quantifiers are
+    /// preserved in the HIR. This is needed for top-level delegation where
+    /// regex-syntax's Hir::repetition constructor would otherwise simplify
+    /// (x){0,0} to Hir::empty() and silently drop capture group slots, causing
+    /// a mismatch between the parser's group numbering and regex-automata's.
+    /// When false (the default, used for per-fragment VM delegates), {0}
+    /// repetitions are simplified to empty, matching regex-syntax's behavior.
+    preserve_zero_rep_captures: bool,
+    /// Group indices that are inside {0} (zero-repetition) quantifiers,
+    /// populated when preserve_zero_rep_captures is true. These groups never
+    /// participate in matching, so their captures should return None even
+    /// though they exist in the HIR for group-counting purposes.
+    zero_rep_groups: BitSet,
 }
 
 impl HirCtx {
@@ -58,7 +76,36 @@ impl HirCtx {
             unicode,
             utf8,
             next_group: 1,
+            fragments: BTreeMap::new(),
+            preserve_zero_rep_captures: false,
+            zero_rep_groups: BitSet::new(),
         }
+    }
+
+    /// Whether the UTF8 mode is enabled
+    pub(crate) fn utf8(&self) -> bool {
+        self.utf8
+    }
+
+    /// Enable preserving capture group slots for groups inside {0} (zero-
+    /// repetition) quantifiers. See `preserve_zero_rep_captures` field.
+    pub(crate) fn enable_preserve_zero_rep_captures(&mut self) {
+        self.preserve_zero_rep_captures = true;
+    }
+
+    /// Returns the set of group indices that are inside {0} (zero-repetition)
+    /// quantifiers. Only populated when preserve_zero_rep_captures is enabled.
+    pub(crate) fn into_zero_rep_groups(self) -> BitSet {
+        self.zero_rep_groups
+    }
+}
+
+impl From<&RegexOptions> for HirCtx {
+    fn from(options: &RegexOptions) -> Self {
+        let unicode =
+            options.syntaxc.get_unicode() && !matches!(options.bytes_mode, BytesMode::Ascii);
+        let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
+        Self::new(unicode, utf8)
     }
 }
 
@@ -94,6 +141,17 @@ pub(crate) fn expr_to_hir(expr: &Expr, ctx: &mut HirCtx) -> Option<Hir> {
                 push_quoted(&mut cooked, val);
                 cooked.push(')');
                 parse_fragment(&cooked, ctx)?
+            }
+        }
+        Expr::LiteralBytes { ref bytes, .. } => {
+            if ctx.utf8 {
+                let s: String = bytes
+                    .iter()
+                    .map(|&b| char::from_u32(b as u32).unwrap())
+                    .collect();
+                Hir::literal(s.as_bytes())
+            } else {
+                Hir::literal(bytes.as_slice())
             }
         }
         Expr::Assertion(assertion) => Hir::look(match assertion {
@@ -140,6 +198,20 @@ pub(crate) fn expr_to_hir(expr: &Expr, ctx: &mut HirCtx) -> Option<Hir> {
             hi,
             greedy,
         } => {
+            // When the repetition is {0,0} (zero repetitions), regex-syntax's
+            // Hir::repetition constructor simplifies it to Hir::empty(),
+            // silently dropping any capture groups inside. When
+            // preserve_zero_rep_captures is true (for top-level delegation),
+            // we keep those capture slots so group numbering stays consistent.
+            // When false (for per-fragment VM delegates), we let the
+            // simplification happen as it does for the string path.
+            if lo == 0 && hi == 0 && ctx.preserve_zero_rep_captures {
+                let sub = expr_to_hir(child, ctx)?;
+                return Some(make_zero_rep_empty_with_captures(
+                    sub,
+                    &mut ctx.zero_rep_groups,
+                ));
+            }
             let min = u32::try_from(lo).ok()?;
             let max = if hi == usize::MAX {
                 None
@@ -171,13 +243,72 @@ pub(crate) fn expr_to_hir(expr: &Expr, ctx: &mut HirCtx) -> Option<Hir> {
     })
 }
 
-fn parse_fragment(fragment: &str, ctx: &HirCtx) -> Option<Hir> {
-    regex_syntax::ParserBuilder::new()
+/// Recursively replace the sub-expression of every [`Capture`] with
+/// [`Hir::empty`] while preserving the capture group structure (index, name).
+///
+/// This is used for `{0}` (zero-repetition) quantifiers: regex-syntax's
+/// [`Hir::repetition`] constructor simplifies `(x){0,0}` to
+/// [`Hir::empty`], silently dropping any capture groups inside. By preserving
+/// the capture group slots (with empty content), regex-automata allocates the
+/// correct number of capture group slots and assigns correct group numbers,
+/// keeping the HIR's group numbering consistent with the parser's.
+fn make_zero_rep_empty_with_captures(hir: Hir, zero_rep_groups: &mut BitSet) -> Hir {
+    match hir.into_kind() {
+        HirKind::Capture(capture) => {
+            zero_rep_groups.insert(capture.index as usize);
+            let sub = make_zero_rep_empty_with_captures(*capture.sub, zero_rep_groups);
+            Hir::capture(Capture {
+                index: capture.index,
+                name: capture.name,
+                sub: Box::new(sub),
+            })
+        }
+        HirKind::Concat(subs) => {
+            let new_subs: Vec<Hir> = subs
+                .into_iter()
+                .map(|s| make_zero_rep_empty_with_captures(s, zero_rep_groups))
+                .collect();
+            Hir::concat(new_subs)
+        }
+        HirKind::Alternation(subs) => {
+            let new_subs: Vec<Hir> = subs
+                .into_iter()
+                .map(|s| make_zero_rep_empty_with_captures(s, zero_rep_groups))
+                .collect();
+            Hir::alternation(new_subs)
+        }
+        HirKind::Repetition(rep) => {
+            let sub = make_zero_rep_empty_with_captures(*rep.sub, zero_rep_groups);
+            Hir::repetition(Repetition {
+                min: rep.min,
+                max: rep.max,
+                greedy: rep.greedy,
+                sub: Box::new(sub),
+            })
+        }
+        _ => Hir::empty(),
+    }
+}
+
+pub(crate) fn parse_fragment(fragment: &str, ctx: &mut HirCtx) -> Option<Hir> {
+    // Only case-insensitive fragments are worth memoizing since folding
+    // is the expensive piece
+    let memoize = fragment.starts_with("(?i:");
+    if memoize {
+        if let Some(hir) = ctx.fragments.get(fragment) {
+            return hir.clone();
+        }
+    }
+    let hir = regex_syntax::ParserBuilder::new()
         .utf8(ctx.utf8)
         .unicode(ctx.unicode)
         .build()
         .parse(fragment)
-        .ok()
+        .ok();
+    if memoize {
+        ctx.fragments.insert(fragment.into(), hir.clone());
+    }
+    hir
 }
 
 #[cfg(test)]

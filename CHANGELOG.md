@@ -9,7 +9,14 @@ with the exception that 0.x versions can break between minor versions.
 ## [Unreleased]
 ### Added
 - A scoped group holding only backreferences may change the Unicode flag, e.g. `(?i-u:\1)`, to fold those references by ASCII alone: an ASCII letter matches either case of itself and every other character only itself, as Python's `re.ASCII | re.IGNORECASE` does. Any other inline Unicode change is still refused.
+- Add `RegexOptionsBuilder::build_delegate_prefilter` to disable building the prefilter
+- Add `RegexOptionsBuilder::start_bytes` that returns the first bytes that can match a pattern so you can build your own prefilter
+- Add `RegexOptionsBuilder::required_bytes` that returns the required bytes for a pattern to match
+- Add `RegexOptionsBuilder::max_prog_size` / `RegexBuilder::max_prog_size` to cap the number of VM instructions emitted while compiling. Subroutine calls are inlined at compile time, so a self- or mutually-recursive pattern can expand without bound even while the recursion-depth cap is respected; this bounds the emitted instruction vector instead. Exceeding the cap returns `CompileError::PatternTooComplex`. Disabled by default.
+
 ### Changed
+- The parser now tracks every capture group declared with the same name; `Regex::capture_names` reports the name for each of them, and named backrefs resolve to the last group with that name (#177)
+- If a lookbehind consists of an Alt containing only easy expressions and at least 4 branches (and no capture groups), compile it as a variable lookbehind (if the feature is enabled) instead of trying every branch as its own const-size lookbehind. One reverse-DFA delegate over the whole alternation is much cheaper per attempt, and grants a perf boost.
 ### Fixed
 - A case-insensitive backreference in non-Unicode mode failed on any text that was not entirely ASCII, even where only its ASCII letters differed in case (`éS` against `és`). It now folds the ASCII letters and compares everything else exactly.
 
@@ -18,6 +25,8 @@ with the exception that 0.x versions can break between minor versions.
 - Add a `leftmost_longest` feature (off by default) that adds a method to the `RegexBuilder`/`RegexOptionsBuilder` for building a VM which would operate in leftmost-longest match mode instead of the regular leftmost-first mode. Useful for POSIX compliance. (#281)
 ### Changed
 ### Fixed
+- Fix a panic in `capture_names()` for a pattern with a zero-repeated named group such as `(?<n>a){0}` (#275)
+- Literal bytes were being encoded as utf-8 in Ascii mode, now they match the exact byte literal
 
 ## [0.19.1] - 2026-09-06
 ### Added
