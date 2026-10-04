@@ -1304,6 +1304,7 @@ mod tests {
                 crate::AstNode::Backref {
                     target: crate::CaptureGroupTarget::ByNumber(1),
                     casei: false,
+                    unicode: true,
                     relative_recursion_level: None,
                 },
                 0,

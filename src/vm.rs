@@ -909,8 +909,10 @@ fn matches_literal_casei<S: HaystackInput + ?Sized>(
         return text_bytes.eq_ignore_ascii_case(literal);
     }
     if !unicode {
-        // ASCII-only case folding: if content is not ASCII, no match
-        return false;
+        // ASCII-only case folding: an ASCII letter matches either case of itself and every
+        // other character only itself. UTF-8 never encodes a non-ASCII character with an
+        // ASCII byte, so a byte-wise ASCII fold is exactly that.
+        return text_bytes.eq_ignore_ascii_case(literal);
     }
     // text captured and being backreferenced is not ascii, so we utilize regex-automata's case insensitive matching
     if let (Ok(text_str), Ok(lit_str)) = (

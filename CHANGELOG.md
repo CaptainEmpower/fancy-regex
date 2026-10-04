@@ -8,8 +8,10 @@ with the exception that 0.x versions can break between minor versions.
 
 ## [Unreleased]
 ### Added
+- A scoped group holding only backreferences may change the Unicode flag, e.g. `(?i-u:\1)`, to fold those references by ASCII alone: an ASCII letter matches either case of itself and every other character only itself, as Python's `re.ASCII | re.IGNORECASE` does. Any other inline Unicode change is still refused.
 ### Changed
 ### Fixed
+- A case-insensitive backreference in non-Unicode mode failed on any text that was not entirely ASCII, even where only its ASCII letters differed in case (`éS` against `és`). It now folds the ASCII letters and compares everything else exactly.
 
 ## [0.19.2] - 2026-09-13
 ### Added
